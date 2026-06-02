@@ -1,0 +1,407 @@
+﻿from pathlib import Path
+import argparse
+import random
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+
+from sklearn.compose import ColumnTransformer
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.impute import SimpleImputer
+from sklearn.metrics import (
+    accuracy_score,
+    precision_score,
+    recall_score,
+    f1_score,
+    classification_report,
+    ConfusionMatrixDisplay,
+)
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.decomposition import TruncatedSVD
+
+PROJECT_ROOT = Path(r"D:\homework\FakeJobRisk_Project")
+DATA_DIR = PROJECT_ROOT / "data" / "processed"
+FIG_DIR = PROJECT_ROOT / "results" / "figures"
+TABLE_DIR = PROJECT_ROOT / "results" / "tables"
+FIG_DIR.mkdir(parents=True, exist_ok=True)
+TABLE_DIR.mkdir(parents=True, exist_ok=True)
+
+TRAIN_PATH = DATA_DIR / "train.csv"
+VAL_PATH = DATA_DIR / "val.csv"
+TEST_PATH = DATA_DIR / "test.csv"
+
+TEXT_COLS = ["title", "company_profile", "description", "requirements", "benefits"]
+CAT_COLS = ["employment_type", "required_experience", "required_education", "industry", "function"]
+NUM_COLS = ["telecommuting", "has_company_logo", "has_questions"]
+TARGET_COL = "fraudulent"
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Train MLP classifier for fake job postings.")
+    parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
+    parser.add_argument("--batch_size", type=int, default=64, help="Batch size")
+    parser.add_argument("--epochs", type=int, default=100, help="Max epochs")
+    parser.add_argument("--dropout", type=float, default=0.3, help="Dropout rate")
+    parser.add_argument("--svd_components", type=int, default=256, help="TruncatedSVD components")
+    parser.add_argument("--patience", type=int, default=10, help="Early stopping patience")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument("--model_name", type=str, default="mlp_ce_new", help="Output name prefix")
+    return parser.parse_args()
+
+def seed_everything(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+class TabularDataset(Dataset):
+    def __init__(self, X, y):
+        self.X = torch.tensor(X, dtype=torch.float32)
+        self.y = torch.tensor(y, dtype=torch.long)
+
+    def __len__(self):
+        return len(self.y)
+
+    def __getitem__(self, idx):
+        return self.X[idx], self.y[idx]
+
+class MLPClassifier(nn.Module):
+    def __init__(self, input_dim, dropout=0.3, num_classes=2):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, 128),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(64, num_classes)
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+def load_data():
+    train_df = pd.read_csv(TRAIN_PATH)
+    val_df = pd.read_csv(VAL_PATH)
+    test_df = pd.read_csv(TEST_PATH)
+    return train_df, val_df, test_df
+
+def combine_text(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    for col in TEXT_COLS:
+        if col not in df.columns:
+            df[col] = ""
+        df[col] = df[col].fillna("").astype(str)
+    df["combined_text"] = (
+        df[TEXT_COLS]
+        .agg(" ".join, axis=1)
+        .str.replace(r"\s+", " ", regex=True)
+        .str.strip()
+    )
+    return df
+
+def make_xy(df: pd.DataFrame):
+    df = combine_text(df)
+    y = df[TARGET_COL].astype(int).values
+    X = df[["combined_text"] + CAT_COLS + NUM_COLS].copy()
+
+    for col in CAT_COLS:
+        if col not in X.columns:
+            X[col] = "Unknown"
+        X[col] = X[col].fillna("Unknown").astype(str)
+
+    for col in NUM_COLS:
+        if col not in X.columns:
+            X[col] = 0
+        X[col] = pd.to_numeric(X[col], errors="coerce").fillna(0).astype(int)
+
+    return X, y
+
+def build_preprocessor():
+    text_transformer = Pipeline([
+        ("tfidf", TfidfVectorizer(
+            max_features=20000,
+            ngram_range=(1, 2),
+            min_df=2
+        ))
+    ])
+
+    cat_transformer = Pipeline([
+        ("imputer", SimpleImputer(strategy="most_frequent")),
+        ("onehot", OneHotEncoder(handle_unknown="ignore"))
+    ])
+
+    num_transformer = Pipeline([
+        ("imputer", SimpleImputer(strategy="most_frequent"))
+    ])
+
+    return ColumnTransformer(
+        transformers=[
+            ("text", text_transformer, "combined_text"),
+            ("cat", cat_transformer, CAT_COLS),
+            ("num", num_transformer, NUM_COLS),
+        ],
+        remainder="drop",
+        sparse_threshold=1.0
+    )
+
+def to_dense_array(X):
+    if hasattr(X, "toarray"):
+        return X.toarray()
+    return np.asarray(X)
+
+def metrics_from_preds(y_true, y_pred):
+    return {
+        "accuracy": accuracy_score(y_true, y_pred),
+        "precision": precision_score(y_true, y_pred, zero_division=0),
+        "recall": recall_score(y_true, y_pred, zero_division=0),
+        "f1": f1_score(y_true, y_pred, zero_division=0),
+        "macro_f1": f1_score(y_true, y_pred, average="macro", zero_division=0),
+    }
+
+@torch.no_grad()
+def predict(model, X_tensor):
+    model.eval()
+    logits = model(X_tensor)
+    preds = torch.argmax(logits, dim=1).cpu().numpy()
+    return preds
+
+def save_confusion_matrix(y_true, y_pred, title, out_path):
+    fig, ax = plt.subplots(figsize=(6, 5))
+    ConfusionMatrixDisplay.from_predictions(
+        y_true,
+        y_pred,
+        cmap="Blues",
+        values_format="d",
+        ax=ax
+    )
+    ax.set_title(title)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=200)
+    plt.close()
+
+def main():
+    args = parse_args()
+    seed_everything(args.seed)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+    print(f"Config: lr={args.lr}, batch_size={args.batch_size}, epochs={args.epochs}, "
+          f"dropout={args.dropout}, svd_components={args.svd_components}, patience={args.patience}")
+    print(f"Model name: {args.model_name}")
+
+    train_df, val_df, test_df = load_data()
+    X_train_df, y_train = make_xy(train_df)
+    X_val_df, y_val = make_xy(val_df)
+    X_test_df, y_test = make_xy(test_df)
+
+    preprocessor = build_preprocessor()
+
+    print("Fitting preprocessor on train data...")
+    X_train = preprocessor.fit_transform(X_train_df)
+    X_val = preprocessor.transform(X_val_df)
+    X_test = preprocessor.transform(X_test_df)
+
+    print("Applying SVD dimensionality reduction...")
+    svd = TruncatedSVD(n_components=args.svd_components, random_state=args.seed)
+    X_train = svd.fit_transform(X_train)
+    X_val = svd.transform(X_val)
+    X_test = svd.transform(X_test)
+
+    scaler = StandardScaler()
+    X_train = scaler.fit_transform(X_train)
+    X_val = scaler.transform(X_val)
+    X_test = scaler.transform(X_test)
+
+    print("Feature shape after SVD:", X_train.shape)
+
+    train_dataset = TabularDataset(X_train, y_train)
+    val_dataset = TabularDataset(X_val, y_val)
+    test_dataset = TabularDataset(X_test, y_test)
+
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False)
+    test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False)
+
+    model = MLPClassifier(
+        input_dim=X_train.shape[1],
+        dropout=args.dropout,
+        num_classes=2
+    ).to(device)
+
+    criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="max", factor=0.5, patience=3
+    )
+
+    best_val_macro_f1 = -1.0
+    best_state = None
+    patience_counter = 0
+
+    history = {
+        "epoch": [],
+        "train_loss": [],
+        "val_loss": [],
+        "train_acc": [],
+        "val_acc": [],
+        "val_macro_f1": [],
+    }
+
+    for epoch in range(1, args.epochs + 1):
+        model.train()
+        train_losses = []
+        train_true = []
+        train_pred = []
+
+        for xb, yb in train_loader:
+            xb = xb.to(device)
+            yb = yb.to(device)
+
+            optimizer.zero_grad()
+            logits = model(xb)
+            loss = criterion(logits, yb)
+            loss.backward()
+            optimizer.step()
+
+            train_losses.append(loss.item())
+            preds = torch.argmax(logits, dim=1)
+            train_true.extend(yb.cpu().numpy().tolist())
+            train_pred.extend(preds.cpu().numpy().tolist())
+
+        train_loss = float(np.mean(train_losses))
+        train_acc = accuracy_score(train_true, train_pred)
+
+        model.eval()
+        val_losses = []
+        val_true = []
+        val_pred = []
+
+        with torch.no_grad():
+            for xb, yb in val_loader:
+                xb = xb.to(device)
+                yb = yb.to(device)
+
+                logits = model(xb)
+                loss = criterion(logits, yb)
+                val_losses.append(loss.item())
+
+                preds = torch.argmax(logits, dim=1)
+                val_true.extend(yb.cpu().numpy().tolist())
+                val_pred.extend(preds.cpu().numpy().tolist())
+
+        val_loss = float(np.mean(val_losses))
+        val_metrics = metrics_from_preds(np.array(val_true), np.array(val_pred))
+
+        history["epoch"].append(epoch)
+        history["train_loss"].append(train_loss)
+        history["val_loss"].append(val_loss)
+        history["train_acc"].append(train_acc)
+        history["val_acc"].append(val_metrics["accuracy"])
+        history["val_macro_f1"].append(val_metrics["macro_f1"])
+
+        scheduler.step(val_metrics["macro_f1"])
+
+        print(
+            f"Epoch {epoch:03d}/{args.epochs} | "
+            f"train_loss={train_loss:.4f} | val_loss={val_loss:.4f} | "
+            f"train_acc={train_acc:.4f} | val_acc={val_metrics['accuracy']:.4f} | "
+            f"val_macro_f1={val_metrics['macro_f1']:.4f}"
+        )
+
+        if val_metrics["macro_f1"] > best_val_macro_f1:
+            best_val_macro_f1 = val_metrics["macro_f1"]
+            best_state = model.state_dict()
+            patience_counter = 0
+        else:
+            patience_counter += 1
+            if patience_counter >= args.patience:
+                print("Early stopping triggered.")
+                break
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+
+    train_pred = predict(model, torch.tensor(X_train, dtype=torch.float32).to(device))
+    val_pred = predict(model, torch.tensor(X_val, dtype=torch.float32).to(device))
+    test_pred = predict(model, torch.tensor(X_test, dtype=torch.float32).to(device))
+
+    print("\n========== MLP Validation ==========")
+    print(classification_report(y_val, val_pred, digits=4, zero_division=0))
+
+    print("\n========== MLP Test ==========")
+    print(classification_report(y_test, test_pred, digits=4, zero_division=0))
+
+    val_metrics = metrics_from_preds(y_val, val_pred)
+    test_metrics = metrics_from_preds(y_test, test_pred)
+
+    results_df = pd.DataFrame([{
+        "model": args.model_name,
+        "lr": args.lr,
+        "batch_size": args.batch_size,
+        "epochs": args.epochs,
+        "dropout": args.dropout,
+        "svd_components": args.svd_components,
+        "val_accuracy": val_metrics["accuracy"],
+        "val_precision": val_metrics["precision"],
+        "val_recall": val_metrics["recall"],
+        "val_f1": val_metrics["f1"],
+        "val_macro_f1": val_metrics["macro_f1"],
+        "test_accuracy": test_metrics["accuracy"],
+        "test_precision": test_metrics["precision"],
+        "test_recall": test_metrics["recall"],
+        "test_f1": test_metrics["f1"],
+        "test_macro_f1": test_metrics["macro_f1"],
+    }])
+
+    results_path = TABLE_DIR / f"{args.model_name}_metrics.csv"
+    results_df.to_csv(results_path, index=False, encoding="utf-8-sig")
+
+    pred_path = TABLE_DIR / f"{args.model_name}_test_predictions.csv"
+    pd.DataFrame({"y_true": y_test, "y_pred": test_pred}).to_csv(pred_path, index=False, encoding="utf-8-sig")
+
+    cm_path = FIG_DIR / f"{args.model_name}_test_confusion_matrix.png"
+    save_confusion_matrix(y_test, test_pred, f"{args.model_name} - Test Confusion Matrix", cm_path)
+
+    plt.figure(figsize=(10, 4))
+    plt.subplot(1, 2, 1)
+    plt.plot(history["epoch"], history["train_loss"], label="train_loss")
+    plt.plot(history["epoch"], history["val_loss"], label="val_loss")
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.title("Loss Curve")
+    plt.legend()
+
+    plt.subplot(1, 2, 2)
+    plt.plot(history["epoch"], history["train_acc"], label="train_acc")
+    plt.plot(history["epoch"], history["val_acc"], label="val_acc")
+    plt.xlabel("Epoch")
+    plt.ylabel("Accuracy")
+    plt.title("Accuracy Curve")
+    plt.legend()
+
+    plt.tight_layout()
+    curve_path = FIG_DIR / f"{args.model_name}_training_curve.png"
+    plt.savefig(curve_path, dpi=200)
+    plt.close()
+
+    history_path = TABLE_DIR / f"{args.model_name}_training_history.csv"
+    pd.DataFrame(history).to_csv(history_path, index=False, encoding="utf-8-sig")
+
+    print("\n========== Summary ==========")
+    print(results_df.round(4).to_string(index=False))
+    print(f"\nSaved metrics to: {results_path}")
+    print(f"Saved predictions to: {pred_path}")
+    print(f"Saved confusion matrix to: {cm_path}")
+    print(f"Saved training curve to: {curve_path}")
+    print(f"Saved history to: {history_path}")
+
+if __name__ == "__main__":
+    main()

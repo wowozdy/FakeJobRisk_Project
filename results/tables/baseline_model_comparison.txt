@@ -1,0 +1,17 @@
+Baseline Comparison Summary
+========================================
+Random guess runs: 1000
+Random seed: 42
+
+        model  accuracy  precision  recall     f1  macro_f1
+mlp_ce_lr0001    0.9883     0.9517  0.7977 0.8679    0.9309
+  logreg_full    0.9678     0.6115  0.9191 0.7344    0.8586
+rf_structured    0.9357     0.4095  0.7457 0.5287    0.7471
+      nb_full    0.9650     0.8077  0.3642 0.5020    0.7419
+ random_guess    0.9079     0.0488  0.0488 0.0488    0.5002
+majority_vote    0.9516     0.0000  0.0000 0.0000    0.4876
+
+Baseline Details
+----------------------------------------
+Random guess mean metrics: Accuracy=0.9079, Precision=0.0488, Recall=0.0488, F1=0.0488, Macro-F1=0.5002
+Majority vote class: 0, TP=0, TN=3403, FP=0, FN=173, Accuracy=0.9516, Precision=0.0000, Recall=0.0000, F1=0.0000, Macro-F1=0.4876
