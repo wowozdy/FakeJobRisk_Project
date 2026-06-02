@@ -27,7 +27,8 @@ FakeJobRisk_Project/
 │   └── error_analysis.py   # 错误样本深度挖掘脚本
 ├── requirements.txt        # 环境依赖清单
 └── README.md
-📊 实验结果预览
+
+## 📊 实验结果预览
 1. 模型性能对比 (Test Set)
 模型	Accuracy	Precision (Fraud)	Recall (Fraud)	Macro-F1
 MLP (最优)	0.9883	0.9517	0.7977	0.9309
